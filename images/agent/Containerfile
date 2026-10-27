@@ -1,0 +1,26 @@
+# Default sandbox image: a Debian userland with git and common dev tooling,
+# plus coding agents. Build with:
+#
+#   container build -t sandbox-agent:latest images/agent
+#
+# sandboxd overrides the entrypoint with `sleep infinity` and runs everything
+# via `container exec`, so there is no CMD here.
+# Node 24: built-in fetch honors HTTPS_PROXY (NODE_USE_ENV_PROXY) without warnings.
+FROM docker.io/library/node:24-bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash ca-certificates curl fd-find git jq less procps python3 python3-venv ripgrep unzip \
+ && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+ && rm -rf /var/lib/apt/lists/*
+
+# Worktree files are owned by your macOS uid; git inside the VM runs as root.
+# Mark everything safe and keep the host-side guard as the line of defense.
+RUN git config --system safe.directory '*' \
+ && git config --system init.defaultBranch main
+
+# Agents. Drop the ones you don't use; add others the same way.
+ARG AGENTS="@anthropic-ai/claude-code @openai/codex @earendil-works/pi-coding-agent"
+RUN npm install -g --no-fund --no-audit ${AGENTS} && npm cache clean --force
+
+WORKDIR /workspace

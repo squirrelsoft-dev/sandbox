@@ -1,0 +1,15 @@
+[package]
+name = "sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sandbox-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+humantime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

@@ -220,3 +220,7 @@ cargo run -p sandbox -- create --scratch --image alpine:3.20 -a dl-cdn.alpinelin
 - Agents run as root inside their VM. The VM is the isolation boundary.
 - Force-deleting a running container (outside sandboxd) can leave its network
   undeletable until `container system stop && container system start`.
+
+## License
+
+MIT. Copyright (c) 2026 SquirrelSoft LLC. See [LICENSE](LICENSE).

@@ -54,17 +54,54 @@ host's credentials.
    being forwarded, so queries can't carry data out. This exists for tools
    that resolve a name before connecting (SSRF guards like pi-safe-search's
    `web_fetch`); the connection itself still has to go through the proxy.
-6. **Install the pf anchor** (`sudo scripts/firewall.sh install`). Without it,
+6. **Install the pf anchor** (`sandbox firewall --install`). Without it,
    services on the host that listen on all interfaces (dev servers, AirPlay
    receiver on :5000/:7000, ...) can be reached from the sandbox through the
    gateway address over IPv4 and IPv6. The anchor drops all sandbox traffic to
-   the host except the proxy port, and redirects port 53 to sandboxd's
+   the host except the proxy and forward ports you open, and redirects port 53 to sandboxd's
    resolver (binding 53 needs root on macOS). Without the anchor, sandboxes
    have no DNS.
 
 Tools must honor `HTTPS_PROXY` (curl, git over https, npm, pip, cargo, Claude
 Code, and Node 24+ with `NODE_USE_ENV_PROXY=1` all do). SSH remotes won't
 work: use HTTPS.
+
+### Databases and other services
+
+The proxy only speaks HTTP, and it refuses private addresses, so a sandbox
+can't reach a Postgres on your Mac or a Redis on your LAN through it. Forward
+the service instead:
+
+```sh
+sandbox create --forward localhost:5432          # Postgres on your Mac
+sandbox create --forward 15100=10.0.1.20:6379    # Redis on the LAN, explicit port
+sandbox forward 3fa2c1 localhost:3306            # add one to a running sandbox
+sandbox unforward 3fa2c1 15306
+sandbox firewall --open 15432                    # let sandboxes reach the port (sudo)
+```
+
+sandboxd listens on the sandbox's gateway and relays each connection to the
+target, so any TCP client works. Inside the sandbox, connect to
+`$SANDBOX_GATEWAY:<port>`. The port defaults to `15000 + port % 1000`
+(5432 → 15432, 6379 → 15379) and must be within `forward_ports`
+(15000–15999):
+
+```sh
+psql "postgres://me@$SANDBOX_GATEWAY:15432/app"
+```
+
+A forward is the one way to reach a private address, and it opens exactly
+that host and port. Connections are logged as `FORWARD` in the egress log.
+The gateway is in `NO_PROXY`, so HTTP clients reach forwarded services
+directly.
+
+With the pf anchor installed, a forward port is also closed at the firewall
+until you open it with `sandbox firewall --open PORT` (which runs under
+sudo). That's deliberate: neither an agent nor sandboxd can expose a port on
+your Mac, and opening one is a separate, privileged step. `create` and
+`sandbox forward` print the command when a port is still closed. Only ports
+in `forward_ports` can be opened, and an opened port admits any sandbox, so
+close it with `--close` when you're done.
 
 ### Workspaces
 
@@ -105,6 +142,7 @@ allow = ["llm.example.com"]            # extra hosts
 env = ["ANTHROPIC_API_KEY"]            # forwarded from your shell if set, never stored
 setup = ["npm install -g some-plugin"] # run once at create, in /workspace
 setup_allow = ["registry.npmjs.org"]   # reachable only while setup runs
+forward = ["localhost:5432"]           # host services to relay in (see below)
 
 [[config]]                             # host config copied in (not mounted)
 host = "~/.pi/agent"
@@ -156,7 +194,7 @@ Rust.
 ```sh
 container build -t sandbox-agent:latest images/agent   # default image (pi, claude, codex)
 scripts/install.sh                                     # binaries + launchd agent
-sudo scripts/firewall.sh install                       # pf anchor (recommended)
+sandbox firewall --install                             # pf anchor (recommended; sudo)
 ```
 
 If the build can't resolve hosts (common with Tailscale or other VPN DNS on
@@ -187,11 +225,13 @@ Files:
 
 | Command | |
 | --- | --- |
-| `sandbox create [-A AGENT]… [--no-agent] [--run \| --shell] [-p PROFILE]… [-a HOST]… [-e KEY[=VAL]]… [--repo P \| --scratch] [-b BRANCH] [--base REF] [--ttl 2h] [--image I] [--cpus N] [--memory 8G] [-n NAME] [--rm] [-q]` | Create a sandbox |
+| `sandbox create [-A AGENT]… [--no-agent] [--run \| --shell] [-p PROFILE]… [-a HOST]… [-e KEY[=VAL]]… [--forward [PORT=]HOST:PORT]… [--repo P \| --scratch] [-b BRANCH] [--base REF] [--ttl 2h] [--image I] [--cpus N] [--memory 8G] [-n NAME] [--rm] [-q]` | Create a sandbox |
 | `sandbox agent [ID] [-A NAME] [-- ARGS…]` | Start the sandbox's agent (interactive) |
 | `sandbox shell [ID]` | Interactive login shell in `/workspace` |
 | `sandbox exec [ID] -- CMD…` | Run a command, exit with its status |
 | `sandbox allow ID HOST…` / `sandbox deny ID HOST…` | Change the allowlist live |
+| `sandbox forward ID [[PORT=]HOST:PORT…]` / `sandbox unforward ID PORT…` | List, add, or remove port forwards live |
+| `sandbox firewall [--open PORT]… [--close PORT]… [--install \| --uninstall]` | Host firewall status and changes (sudo) |
 | `sandbox logs [ID] [-f] [--denied] [--json]` | Egress log |
 | `sandbox ls`, `sandbox info [ID]` | Inspect |
 | `sandbox destroy [ID] [--discard]` | Tear down, return worktree |
@@ -223,7 +263,8 @@ cargo run -p sandbox -- create --scratch --image alpine:3.20 -a dl-cdn.alpinelin
 
 ## Known limits
 
-- One proxy port per gateway means one sandbox per network (by design).
+- A sandbox is a single container. For databases and other services, use
+  `--forward` to a service on your Mac or LAN, or install it in the image.
 - `sandbox deny` affects new connections only; open tunnels run to completion.
 - The git guard polls, so there is a window of up to 3s before a planted
   config entry is reverted. Don't run git in the repo on the host while an

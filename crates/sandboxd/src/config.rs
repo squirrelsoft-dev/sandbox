@@ -22,6 +22,9 @@ pub struct Config {
     /// Port of the allowlist-scoped DNS responder on each gateway. Port 53
     /// needs root on macOS, so the pf anchor redirects 53 here.
     pub dns_port: u16,
+    /// Gateway ports available to `--forward`, as "FIRST-LAST". The pf anchor
+    /// lets sandboxes reach this range on their gateway.
+    pub forward_ports: String,
     /// Sandbox networks are carved from these: `<v4>.N.0/24` and `<v6>:N::/64`.
     /// Keeping them fixed lets a static pf anchor fence sandboxes off from the
     /// host (see scripts/firewall.sh).
@@ -52,6 +55,7 @@ impl Default for Config {
             default_ttl: Duration::from_secs(8 * 3600),
             proxy_port: 3128,
             dns_port: 3053,
+            forward_ports: "15000-15999".into(),
             subnet_prefix_v4: "10.213".into(),
             subnet_prefix_v6: "fd5b:d0c5:a17e".into(),
             allow: Vec::new(),
@@ -71,7 +75,20 @@ impl Config {
             std::fs::write(path, DEFAULT_CONFIG)?;
         }
         let text = std::fs::read_to_string(path)?;
-        toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))
+        let cfg: Self = toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+        cfg.forward_range().with_context(|| format!("invalid {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    pub fn forward_range(&self) -> Result<std::ops::RangeInclusive<u16>> {
+        let parse = || -> Option<(u16, u16)> {
+            let (a, b) = self.forward_ports.split_once('-')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        };
+        match parse() {
+            Some((a, b)) if 1024 <= a && a <= b => Ok(a..=b),
+            _ => anyhow::bail!("forward_ports should be \"FIRST-LAST\" with 1024 <= FIRST <= LAST"),
+        }
     }
 }
 
@@ -137,6 +154,10 @@ proxy_port = 3128
 # DNS for allowlisted names, on each gateway. scripts/firewall.sh redirects
 # sandbox queries on port 53 here; without it sandboxes have no DNS.
 dns_port = 3053
+
+# Gateway ports for --forward. scripts/firewall.sh opens this range; change
+# both together.
+forward_ports = "15000-15999"
 
 # Sandbox networks use <v4>.N.0/24 and <v6>:N::/64. scripts/firewall.sh
 # installs a pf anchor for these ranges; change both together.

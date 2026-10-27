@@ -7,6 +7,7 @@
 mod agents;
 mod config;
 mod dns;
+mod forward;
 mod gitguard;
 mod manager;
 mod policy;

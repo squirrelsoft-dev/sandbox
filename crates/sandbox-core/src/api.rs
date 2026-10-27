@@ -17,7 +17,7 @@ pub enum Request {
     Profiles,
     /// Agent presets available to `--agent`.
     Agents,
-    Create(CreateRequest),
+    Create(Box<CreateRequest>),
     List,
     /// Look up one sandbox by id, id prefix, name, or a path inside its workspace.
     Get { selector: String },
@@ -27,6 +27,12 @@ pub enum Request {
         selector: String,
         add: Vec<String>,
         remove: Vec<String>,
+    },
+    /// Add `[PORT=]HOST:PORT` forwards and/or remove them by gateway port.
+    Forward {
+        selector: String,
+        add: Vec<String>,
+        remove: Vec<u16>,
     },
 }
 
@@ -52,6 +58,9 @@ pub struct CreateRequest {
     /// `KEY=VALUE` literals stored with the sandbox, or bare `KEY` names the
     /// CLI forwards from its own environment on every exec (never persisted).
     pub env: Vec<String>,
+    /// `[PORT=]HOST:PORT` services to relay into the sandbox.
+    #[serde(default)]
+    pub forward: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,6 +159,48 @@ pub struct AgentMount {
     pub sync_back: Vec<String>,
 }
 
+/// A TCP port on the sandbox's gateway that sandboxd relays to a service the
+/// host can reach (a database on the Mac or the LAN, say). This is the one
+/// way to reach private addresses, so each one is explicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forward {
+    /// Port on the gateway the sandbox connects to.
+    pub listen: u16,
+    pub host: String,
+    pub port: u16,
+}
+
+impl Forward {
+    /// Parse `[LISTEN=]HOST:PORT`. A missing `LISTEN` comes back as 0, for
+    /// sandboxd to pick.
+    pub fn parse(spec: &str) -> anyhow::Result<Self> {
+        let spec = spec.trim();
+        let (listen, target) = match spec.split_once('=') {
+            Some((l, t)) => (l.parse().map_err(|_| anyhow::anyhow!("bad port {l:?} in forward {spec:?}"))?, t),
+            None => (0, spec),
+        };
+        let (host, port) = match target.strip_prefix('[') {
+            Some(rest) => rest.split_once("]:"),
+            None => target.rsplit_once(':').filter(|(h, _)| !h.contains(':')),
+        }
+        .ok_or_else(|| anyhow::anyhow!("forward {spec:?} should look like [PORT=]HOST:PORT"))?;
+        let port: u16 = port.parse().map_err(|_| anyhow::anyhow!("bad port {port:?} in forward {spec:?}"))?;
+        if host.is_empty() || port == 0 {
+            anyhow::bail!("forward {spec:?} should look like [PORT=]HOST:PORT");
+        }
+        Ok(Self { listen, host: host.to_string(), port })
+    }
+
+    /// The target as `host:port`, bracketing IPv6 literals.
+    pub fn target(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sandbox {
     pub id: String,
@@ -164,6 +215,8 @@ pub struct Sandbox {
     #[serde(default)]
     pub agent_mounts: Vec<AgentMount>,
     pub allow: Vec<String>,
+    #[serde(default)]
+    pub forwards: Vec<Forward>,
     pub cpus: u32,
     pub memory: String,
     pub container_ip: Option<String>,
@@ -185,13 +238,39 @@ impl Sandbox {
             for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
                 env.push(format!("{key}={proxy}"));
             }
-            env.push("NO_PROXY=localhost,127.0.0.1,::1".into());
-            env.push("no_proxy=localhost,127.0.0.1,::1".into());
+            // The gateway serves forwarded ports; reach those directly.
+            let no_proxy = match &self.gateway_ip {
+                Some(gw) => format!("localhost,127.0.0.1,::1,{gw}"),
+                None => "localhost,127.0.0.1,::1".into(),
+            };
+            env.push(format!("NO_PROXY={no_proxy}"));
+            env.push(format!("no_proxy={no_proxy}"));
             // Node's built-in fetch ignores *_PROXY unless asked (Node >= 24).
             env.push("NODE_USE_ENV_PROXY=1".into());
         }
         env.push(format!("SANDBOX_ID={}", self.id));
+        if let Some(gw) = &self.gateway_ip {
+            env.push(format!("SANDBOX_GATEWAY={gw}"));
+        }
         env.extend(self.env.iter().cloned());
         env
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_forwards() {
+        let f = Forward::parse("15432=localhost:5432").unwrap();
+        assert_eq!((f.listen, f.host.as_str(), f.port), (15432, "localhost", 5432));
+        let f = Forward::parse("10.0.1.20:6379").unwrap();
+        assert_eq!((f.listen, f.host.as_str(), f.port), (0, "10.0.1.20", 6379));
+        let f = Forward::parse("[fd00::5]:5432").unwrap();
+        assert_eq!((f.host.as_str(), f.target()), ("fd00::5", "[fd00::5]:5432".to_string()));
+        for bad in ["localhost", "x=localhost:5432", "localhost:0", ":5432", "fd00::5:5432", "localhost:99999"] {
+            assert!(Forward::parse(bad).is_err(), "{bad}");
+        }
     }
 }

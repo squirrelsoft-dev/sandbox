@@ -63,6 +63,35 @@ enum Cmd {
         #[arg(required = true)]
         hosts: Vec<String>,
     },
+    /// Relay a host-side service into a sandbox: `sandbox forward ID 15432=localhost:5432`.
+    /// With no specs, list the sandbox's forwards.
+    Forward {
+        sandbox: String,
+        #[arg(value_name = "[PORT=]HOST:PORT")]
+        specs: Vec<String>,
+    },
+    /// Remove forwards by their gateway port.
+    Unforward {
+        sandbox: String,
+        #[arg(required = true, value_name = "PORT")]
+        ports: Vec<u16>,
+    },
+    /// Manage the host firewall (pf anchor) that fences sandboxes off from
+    /// your Mac. With no flags, show its status. Changes run under sudo.
+    Firewall {
+        /// Let sandboxes reach this forward port on their gateway (repeatable).
+        #[arg(long, value_name = "PORT")]
+        open: Vec<u16>,
+        /// Close a forward port again (repeatable).
+        #[arg(long, value_name = "PORT")]
+        close: Vec<u16>,
+        /// Install the anchor and its boot job.
+        #[arg(long, conflicts_with_all = ["open", "close", "uninstall"])]
+        install: bool,
+        /// Remove the anchor, its boot job, and the open-port list.
+        #[arg(long, conflicts_with_all = ["open", "close"])]
+        uninstall: bool,
+    },
     /// Show a sandbox's egress log (every proxied connection, allowed or denied).
     Logs {
         sandbox: Option<String>,
@@ -137,6 +166,11 @@ struct CreateArgs {
     /// exec/shell without storing it (use this for API keys). Repeatable.
     #[arg(short, long = "env", value_name = "KEY[=VALUE]")]
     env: Vec<String>,
+    /// Relay a service the host can reach (a database on your Mac or LAN)
+    /// to $SANDBOX_GATEWAY:PORT. PORT defaults to 15000 + port % 1000, so
+    /// localhost:5432 is reachable at $SANDBOX_GATEWAY:15432. Repeatable.
+    #[arg(long, value_name = "[PORT=]HOST:PORT")]
+    forward: Vec<String>,
     /// Open a shell in the sandbox once it is up.
     #[arg(long, conflicts_with = "run")]
     shell: bool,
@@ -188,6 +222,27 @@ fn run() -> Result<ExitCode> {
                 serde_json::from_value(call(Request::Policy { selector: sandbox, add: vec![], remove: hosts })?)?;
             println!("{} may now reach: {}", sb.id, display_allow(&sb.allow));
         }
+        Cmd::Forward { sandbox, specs } => {
+            let sb: Sandbox = if specs.is_empty() {
+                get(Some(sandbox))?
+            } else {
+                serde_json::from_value(call(Request::Forward { selector: sandbox, add: specs, remove: vec![] })?)?
+            };
+            if sb.forwards.is_empty() {
+                println!("{} has no forwards", sb.id);
+            }
+            forward_lines(&sb).iter().for_each(|l| println!("{l}"));
+            warn_closed_ports(&sb);
+        }
+        Cmd::Unforward { sandbox, ports } => {
+            let sb: Sandbox =
+                serde_json::from_value(call(Request::Forward { selector: sandbox, add: vec![], remove: ports })?)?;
+            if sb.forwards.is_empty() {
+                println!("{} has no forwards", sb.id);
+            }
+            forward_lines(&sb).iter().for_each(|l| println!("{l}"));
+        }
+        Cmd::Firewall { open, close, install, uninstall } => return firewall(&open, &close, install, uninstall),
         Cmd::Logs { sandbox, follow, denied, json } => logs(&get(sandbox)?, follow, denied, json)?,
         Cmd::Destroy { sandbox, discard } => {
             let sb = get(sandbox)?;
@@ -289,8 +344,9 @@ fn create(call: &dyn Fn(Request) -> Result<serde_json::Value>, args: CreateArgs)
         memory: args.memory,
         ttl_secs,
         env,
+        forward: args.forward,
     };
-    let sb: Sandbox = serde_json::from_value(call(Request::Create(req))?)?;
+    let sb: Sandbox = serde_json::from_value(call(Request::Create(Box::new(req)))?)?;
 
     if args.quiet {
         println!("{}", sb.id);
@@ -307,6 +363,10 @@ fn create(call: &dyn Fn(Request) -> Result<serde_json::Value>, args: CreateArgs)
             eprintln!("  agents     {}", names.join(", "));
         }
         eprintln!("  egress     {}", display_allow(&sb.allow));
+        for (i, line) in forward_lines(&sb).iter().enumerate() {
+            eprintln!("  {:<10} {line}", if i == 0 { "forwards" } else { "" });
+        }
+        warn_closed_ports(&sb);
         if let Some(exp) = sb.expires_at {
             eprintln!("  expires    {}", exp.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"));
         }
@@ -431,6 +491,84 @@ fn exec(sb: &Sandbox, command: &[String]) -> Result<ExitCode> {
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let status = container_exec(sb, tty).args(command).status().context("failed to run `container exec`")?;
     Ok(exit_code(status))
+}
+
+/// The firewall script, embedded so `sandbox firewall` works without the repo.
+const FIREWALL_SCRIPT: &str = include_str!("../../../scripts/firewall.sh");
+const FIREWALL_PLIST: &str = "/Library/LaunchDaemons/dev.squirrelsoft.sandboxd.pf.plist";
+const FIREWALL_PORTS: &str = "/etc/pf.anchors/dev.squirrelsoft.sandboxd.ports";
+
+/// Run the embedded firewall script, under sudo for anything that changes pf.
+fn firewall(open: &[u16], close: &[u16], install: bool, uninstall: bool) -> Result<ExitCode> {
+    let mut runs: Vec<Vec<String>> = Vec::new();
+    if install {
+        runs.push(vec!["install".into()]);
+    }
+    if uninstall {
+        runs.push(vec!["uninstall".into()]);
+    }
+    for (cmd, ports) in [("open", open), ("close", close)] {
+        if !ports.is_empty() {
+            runs.push(std::iter::once(cmd.to_string()).chain(ports.iter().map(u16::to_string)).collect());
+        }
+    }
+    if runs.is_empty() {
+        return run_firewall_script(false, &["status".into()]);
+    }
+    for args in runs {
+        let code = run_firewall_script(true, &args)?;
+        if code != ExitCode::SUCCESS {
+            return Ok(code);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_firewall_script(sudo: bool, args: &[String]) -> Result<ExitCode> {
+    use std::io::Write as _;
+    let mut cmd = if sudo { Command::new("sudo") } else { Command::new("/bin/bash") };
+    if sudo {
+        cmd.arg("/bin/bash");
+    }
+    // sudo prompts on the terminal, so the script can come in on stdin.
+    let mut child = cmd
+        .args(["-s", "--"])
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("run the firewall script")?;
+    child.stdin.take().expect("piped stdin").write_all(FIREWALL_SCRIPT.as_bytes())?;
+    let status = child.wait()?;
+    Ok(if status.success() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+/// When the firewall is installed, a forward port is unreachable until it's
+/// opened explicitly. Say so, with the command to run.
+fn warn_closed_ports(sb: &Sandbox) {
+    if sb.forwards.is_empty() || !Path::new(FIREWALL_PLIST).exists() {
+        return;
+    }
+    let open: Vec<u16> = std::fs::read_to_string(FIREWALL_PORTS)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    let closed: Vec<String> =
+        sb.forwards.iter().filter(|f| !open.contains(&f.listen)).map(|f| f.listen.to_string()).collect();
+    if !closed.is_empty() {
+        let flags: Vec<String> = closed.iter().map(|p| format!("--open {p}")).collect();
+        eprintln!(
+            "  note       the firewall blocks port {} until you run: sandbox firewall {}",
+            closed.join(", "),
+            flags.join(" ")
+        );
+    }
+}
+
+/// One line per forward: where the sandbox connects, and where it goes.
+fn forward_lines(sb: &Sandbox) -> Vec<String> {
+    let gw = sb.gateway_ip.as_deref().unwrap_or("$SANDBOX_GATEWAY");
+    sb.forwards.iter().map(|f| format!("{gw}:{} -> {}", f.listen, f.target())).collect()
 }
 
 fn display_allow(allow: &[String]) -> String {

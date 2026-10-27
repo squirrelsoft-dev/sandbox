@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use sandbox_core::api::{Agent, CreateRequest, Sandbox, SandboxState, Workspace, WORKSPACE_MOUNT};
+use sandbox_core::api::{Agent, CreateRequest, Forward, Sandbox, SandboxState, Workspace, WORKSPACE_MOUNT};
 use sandbox_core::paths::Paths;
 
 use crate::agents::{self, Preset};
@@ -167,11 +167,15 @@ impl Manager {
         let mut profiles = if req.profiles.is_empty() { self.cfg.default_profiles.clone() } else { req.profiles.clone() };
         let mut extra_allow = req.allow.clone();
         let mut env = Vec::new();
+        let mut forward_specs = Vec::new();
         for (_, p) in &presets {
             profiles.extend(p.profiles.iter().cloned());
             extra_allow.extend(p.allow.iter().cloned());
             env.extend(p.env.iter().cloned());
+            forward_specs.extend(p.forward.iter().cloned());
         }
+        forward_specs.extend(req.forward.iter().cloned());
+        let forwards = self.assign_forwards(&[], &forward_specs)?;
         for e in &req.env {
             if !env.contains(e) {
                 env.push(e.clone());
@@ -206,6 +210,7 @@ impl Manager {
                 .collect(),
             agent_mounts: Vec::new(),
             allow,
+            forwards,
             cpus: req.cpus.unwrap_or(self.cfg.cpus),
             memory: req.memory.clone().unwrap_or_else(|| self.cfg.memory.clone()),
             container_ip: None,
@@ -368,8 +373,47 @@ impl Manager {
             sb.egress_log.clone(),
         )
         .await?;
+        let (gateway, ctx) = handle.forward_context();
+        for f in &sb.forwards {
+            handle.attach_forward(f.listen, crate::forward::spawn(gateway, f.clone(), ctx.clone()).await?);
+        }
         self.proxies.lock().unwrap().insert(sb.id.clone(), handle);
         Ok(())
+    }
+
+    fn assign_forwards(&self, existing: &[Forward], specs: &[String]) -> Result<Vec<Forward>> {
+        crate::forward::assign(&self.cfg.forward_range()?, existing, specs)
+    }
+
+    pub async fn update_forwards(&self, selector: &str, add: &[String], remove: &[u16]) -> Result<Sandbox> {
+        let mut sb = self.resolve(selector)?;
+        let _busy = self.claim(&sb.id)?;
+        for port in remove {
+            if !sb.forwards.iter().any(|f| f.listen == *port) {
+                bail!("sandbox {} has no forward on port {port}", sb.id);
+            }
+        }
+        sb.forwards.retain(|f| !remove.contains(&f.listen));
+        let added = self.assign_forwards(&sb.forwards, add)?;
+
+        let ctx = self.proxies.lock().unwrap().get(&sb.id).map(|h| {
+            for port in remove {
+                h.detach_forward(*port);
+            }
+            h.forward_context()
+        });
+        if let Some((gateway, ctx)) = ctx {
+            for f in &added {
+                let task = crate::forward::spawn(gateway, f.clone(), ctx.clone()).await?;
+                if let Some(h) = self.proxies.lock().unwrap().get(&sb.id) {
+                    h.attach_forward(f.listen, task);
+                }
+            }
+        }
+        sb.forwards.extend(added);
+        self.store.put(&sb)?;
+        self.store.event(&sb.id, "forward", &format!("add={add:?} remove={remove:?}"));
+        Ok(sb)
     }
 
     /// Put the proxy settings in `/etc/profile.d` so login shells and tools

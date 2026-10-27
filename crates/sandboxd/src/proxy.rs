@@ -6,6 +6,7 @@
 //! HTTP through absolute-form requests; both are checked against the
 //! sandbox's allowlist and recorded in its egress log.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -28,16 +29,42 @@ pub struct ProxyHandle {
     pub policy: Arc<RwLock<Policy>>,
     task: JoinHandle<()>,
     dns: JoinHandle<()>,
+    ctx: Arc<Ctx>,
+    gateway: IpAddr,
+    /// Port forward listeners by gateway port.
+    forwards: Mutex<HashMap<u16, JoinHandle<()>>>,
+}
+
+impl ProxyHandle {
+    /// What a forward listener needs: where to bind, and the shared context.
+    pub fn forward_context(&self) -> (IpAddr, Arc<Ctx>) {
+        (self.gateway, self.ctx.clone())
+    }
+
+    pub fn attach_forward(&self, listen: u16, task: JoinHandle<()>) {
+        if let Some(old) = self.forwards.lock().unwrap().insert(listen, task) {
+            old.abort();
+        }
+    }
+
+    pub fn detach_forward(&self, listen: u16) {
+        if let Some(task) = self.forwards.lock().unwrap().remove(&listen) {
+            task.abort();
+        }
+    }
 }
 
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
         self.task.abort();
         self.dns.abort();
+        for (_, task) in self.forwards.lock().unwrap().drain() {
+            task.abort();
+        }
     }
 }
 
-pub(crate) struct Ctx {
+pub struct Ctx {
     /// Only connections from this address are served; anything else on the
     /// gateway (another sandbox, the LAN) is dropped.
     pub(crate) client_ip: IpAddr,
@@ -84,6 +111,29 @@ impl Ctx {
             block_private_ips: false,
             log: Mutex::new(std::fs::File::create(log).unwrap()),
         }
+    }
+
+    pub(crate) fn record_forward(
+        &self,
+        event: &'static str,
+        peer: SocketAddr,
+        fwd: &sandbox_core::api::Forward,
+        reason: Option<&str>,
+        totals: Option<(u64, u64, u128)>,
+    ) {
+        self.record(Event {
+            ts: chrono::Utc::now().to_rfc3339(),
+            event,
+            client: peer.to_string(),
+            method: "FORWARD",
+            host: &fwd.host,
+            port: fwd.port,
+            allowed: event != "error",
+            reason,
+            bytes_up: totals.map(|t| t.0),
+            bytes_down: totals.map(|t| t.1),
+            duration_ms: totals.map(|t| t.2),
+        });
     }
 
     pub(crate) fn record_dns_deny(&self, peer: SocketAddr, name: &str) {
@@ -147,7 +197,7 @@ pub async fn spawn(
         block_private_ips,
         log: Mutex::new(log),
     });
-    let ctx_dns = ctx.clone();
+    let ctx_shared = ctx.clone();
     let task = tokio::spawn(async move {
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -170,9 +220,16 @@ pub async fn spawn(
             });
         }
     });
-    let dns = crate::dns::spawn(SocketAddr::new(gateway, dns_port), ctx_dns).await?;
+    let dns = crate::dns::spawn(SocketAddr::new(gateway, dns_port), ctx_shared.clone()).await?;
     tracing::info!(%addr, %client_ip, "egress proxy listening");
-    Ok(ProxyHandle { policy, task, dns })
+    Ok(ProxyHandle {
+        policy,
+        task,
+        dns,
+        ctx: ctx_shared,
+        gateway,
+        forwards: Mutex::new(HashMap::new()),
+    })
 }
 
 struct Head {

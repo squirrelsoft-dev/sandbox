@@ -73,12 +73,15 @@ async fn dispatch(req: Request, mgr: &Manager) -> Result<Response> {
         Request::Ping => Response::ok(&env!("CARGO_PKG_VERSION")),
         Request::Profiles => Response::ok(mgr.profiles()),
         Request::Agents => Response::ok(mgr.presets()),
-        Request::Create(c) => Response::ok(&mgr.create(c).await?),
+        Request::Create(c) => Response::ok(&mgr.create(*c).await?),
         Request::List => Response::ok(&mgr.list()?),
         Request::Get { selector } => Response::ok(&mgr.resolve(&selector)?),
         Request::Destroy { selector, discard } => Response::ok(&mgr.destroy(&selector, discard).await?),
         Request::Policy { selector, add, remove } => {
             Response::ok(&mgr.update_policy(&selector, &add, &remove)?)
+        }
+        Request::Forward { selector, add, remove } => {
+            Response::ok(&mgr.update_forwards(&selector, &add, &remove).await?)
         }
     })
 }

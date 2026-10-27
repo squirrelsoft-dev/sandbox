@@ -38,6 +38,9 @@ pub struct Preset {
     /// Hosts reachable only while `setup` runs.
     #[serde(default)]
     pub setup_allow: Vec<String>,
+    /// `[PORT=]HOST:PORT` services relayed into the sandbox (see `--forward`).
+    #[serde(default)]
+    pub forward: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

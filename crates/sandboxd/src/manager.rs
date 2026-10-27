@@ -622,7 +622,15 @@ impl Manager {
             for mut sb in live.into_iter().filter(|s| s.state == SandboxState::Running) {
                 let Ok(_busy) = self.claim(&sb.id) else { continue };
                 let expired = sb.expires_at.is_some_and(|t| t <= Utc::now());
-                let alive = matches!(self.rt.inspect(&sb.container).await, Ok(Some(st)) if st.running);
+                // Only a definite answer counts as exited: a failed inspect
+                // (runtime busy or restarting) is retried on the next pass.
+                let alive = match self.rt.inspect(&sb.container).await {
+                    Ok(st) => st.is_some_and(|st| st.running),
+                    Err(e) => {
+                        tracing::warn!(id = %sb.id, error = %format!("{e:#}"), "cannot inspect container, will retry");
+                        true
+                    }
+                };
                 if expired || !alive {
                     let why = if expired { "expired" } else { "container exited" };
                     tracing::info!(id = %sb.id, why, "tearing down sandbox");

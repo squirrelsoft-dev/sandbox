@@ -13,6 +13,237 @@ sandbox allow 3fa2c1 registry.npmjs.org
 sandbox destroy 3fa2c1
 ```
 
+## Install and usage
+
+### Requirements
+
+- **A Mac with Apple silicon** (M1 or newer). Apple's container runtime
+  doesn't run on Intel Macs.
+- **macOS 26 (Tahoe) or newer.** Tested on macOS 27.
+- **An administrator account.** Installing the firewall asks for your
+  password (`sudo`).
+- **Room to run VMs.** Each sandbox gets 4 CPUs and 4 GB of memory by default
+  (change with `--cpus`/`--memory` or in `config.toml`). The agent image
+  needs a few GB of disk.
+- **Software**, installed in the steps below: Xcode Command Line Tools (for
+  git), Homebrew, Rust, Apple's `container` (1.6.1 or 0.10.0), and
+  [treehouse](https://github.com/kunchenguid/treehouse).
+
+### Install
+
+Run these in Terminal, one step at a time.
+
+**1. Install the Xcode Command Line Tools** (provides `git`). Skip this if
+`git --version` already prints a version.
+
+```sh
+xcode-select --install
+```
+
+**2. Install Homebrew** if `brew --version` doesn't work. Follow the
+instructions at [brew.sh](https://brew.sh), including the lines it prints at
+the end to add `brew` to your PATH.
+
+**3. Install Rust.** Accept the defaults, then close and reopen Terminal.
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+**4. Install Apple's container runtime.** Download the signed installer
+(`container-<version>-installer-signed.pkg`) from
+[github.com/apple/container/releases](https://github.com/apple/container/releases)
+and open it. This project is tested with 1.6.1 and also supports 0.10.0.
+(`brew install container` installs the same tool.) To upgrade an existing
+install, run `container system stop` first, then the new installer.
+Then start the runtime. The first time, it offers to download a
+Linux kernel: answer `Y`.
+
+```sh
+container system start
+container --version          # should print a version
+```
+
+**5. Install treehouse**, which manages the git worktrees agents work in.
+
+```sh
+brew install treehouse
+```
+
+**6. Download this project.**
+
+```sh
+git clone https://github.com/squirrelsoft-dev/sandbox.git
+cd sandbox
+```
+
+**7. Build the agent image.** This is the Linux system each sandbox runs, with
+Claude Code, Codex, and pi preinstalled. It takes a few minutes.
+
+```sh
+container build -t sandbox-agent:latest images/agent
+```
+
+If it fails with errors like `Temporary failure resolving 'deb.debian.org'`
+(common with Tailscale or another VPN), give the builder a public DNS server
+and run the build again:
+
+```sh
+container builder delete
+container builder start --dns 1.1.1.1
+```
+
+Updating `container` recreates the builder without this setting, so run these
+two commands again after an update if builds start failing the same way.
+
+**8. Install sandboxd and the `sandbox` command.** This builds them, copies
+them to `~/.local/bin`, and starts sandboxd in the background (it also starts
+at every login).
+
+```sh
+scripts/install.sh
+```
+
+If the last line says `sandboxd 0.1.0 is running`, it worked. If your shell
+can't find `sandbox` afterwards, add `~/.local/bin` to your PATH:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+**9. Install the firewall.** It stops sandboxes from reaching services on your
+Mac and gives them DNS. It asks for your password.
+
+```sh
+sandbox firewall --install
+```
+
+**10. Check everything.**
+
+```sh
+sandbox status               # sandboxd is running
+sandbox firewall             # Installed.
+sandbox agents               # pi, claude, codex
+```
+
+### Give your agent credentials
+
+Agents run inside a VM, so they can't use logins stored in your Mac's
+Keychain. Set credentials in the terminal you run `sandbox` from. The CLI
+passes them in each time and never saves them.
+
+- **Claude Code** with a Claude subscription:
+  ```sh
+  claude setup-token                          # on your Mac, once
+  export CLAUDE_CODE_OAUTH_TOKEN=<the token>  # add to ~/.zshrc to keep it
+  ```
+  With API billing, use `export ANTHROPIC_API_KEY=<key>` instead.
+- **Codex**: `export OPENAI_API_KEY=<key>`, or log in with `codex` on your Mac
+  first (its `~/.codex/auth.json` is copied in).
+- **pi**: log in with `pi` on your Mac first. Its `~/.pi/agent` config is
+  copied in. Provider API keys such as `ANTHROPIC_API_KEY` are passed through
+  when set.
+
+### Your first sandbox
+
+**1. Go to a git repository** you want the agent to work on, and commit or
+stash anything you care about. The agent works on a separate copy (a
+worktree) on a new branch, but it's good practice.
+
+```sh
+cd ~/code/my-project
+```
+
+**2. Create a sandbox and start the agent.**
+
+```sh
+sandbox create -A claude --run
+```
+
+This:
+
+- creates the branch `sandbox/<id>` and a worktree of your repo, mounted at
+  `/workspace` in the VM
+- starts a VM that can only reach the hosts Claude Code needs
+- starts Claude Code inside it, in `/workspace`
+
+Use `-A pi` or `-A codex` for those agents. Leave out `--run` to create the
+sandbox without starting the agent. Start it later with `sandbox agent`.
+
+**3. Watch or help from a second terminal:**
+
+```sh
+sandbox shell                # a shell inside the sandbox, next to the agent
+sandbox logs --denied        # sites the agent tried to reach and was refused
+```
+
+**4. Let it reach more of the internet when it needs to.** Blocked requests
+fail with a message naming the host. Allow one and it works right away:
+
+```sh
+sandbox allow <id> docs.rs
+```
+
+**5. Review the work.** The agent's commits land on `sandbox/<id>` in your
+repository:
+
+```sh
+git log sandbox/<id>
+git diff main...sandbox/<id>      # use your default branch if it isn't main
+```
+
+**6. Clean up.** This stops the VM and removes the worktree. The branch and
+its commits stay in your repo.
+
+```sh
+sandbox destroy <id>
+```
+
+If the agent left uncommitted changes, `destroy` refuses. Commit them from
+`sandbox shell`, or pass `--discard` to throw them away. Sandboxes also expire
+on their own after 8 hours (`--ttl` changes that).
+
+`<id>` is the short id `create` prints, such as `3fa2c1`. You can also name a
+sandbox (`-n fix-tests`) and use the name. You can leave the id out when only
+one sandbox exists, or when your current directory is inside its worktree.
+
+### Everyday commands
+
+| Task | Command |
+| --- | --- |
+| Start a sandbox with an agent | `sandbox create -A claude --run` |
+| Run a one-off task | `sandbox agent <id> -- -p "fix the failing tests"` |
+| See your sandboxes | `sandbox ls` |
+| Get a shell inside | `sandbox shell <id>` |
+| Run a command inside | `sandbox exec <id> -- npm test` |
+| See network activity | `sandbox logs <id>` (`-f` to follow) |
+| Allow / remove a host | `sandbox allow <id> HOST` / `sandbox deny <id> HOST` |
+| Reach a database on your Mac | `sandbox forward <id> localhost:5432`, then `sandbox firewall --open 15432` |
+| Remove a sandbox | `sandbox destroy <id>` |
+
+### Updating and uninstalling
+
+To update, pull the latest version, reinstall, and rebuild the image:
+
+```sh
+cd sandbox
+git pull
+scripts/install.sh
+sandbox firewall --install
+container build -t sandbox-agent:latest images/agent
+```
+
+To uninstall, destroy your sandboxes first (`sandbox ls`, then
+`sandbox destroy <id>` for each), then:
+
+```sh
+sandbox firewall --uninstall
+scripts/install.sh uninstall
+rm ~/.local/bin/sandbox ~/.local/bin/sandboxd
+rm -rf ~/Library/Application\ Support/Sandboxd ~/Library/Logs/Sandboxd   # settings and logs
+```
+
 ## Architecture
 
 ```
@@ -186,32 +417,16 @@ are skipped.
   labeled `dev.squirrelsoft.sandboxd` that it has no record of.
 - **Daemon down**: proxies stop with it, so sandboxes fail closed.
 
-## Install
-
-Requirements: Apple `container` ≥ 0.10 (`container system start`), treehouse,
-Rust.
-
-```sh
-container build -t sandbox-agent:latest images/agent   # default image (pi, claude, codex)
-scripts/install.sh                                     # binaries + launchd agent
-sandbox firewall --install                             # pf anchor (recommended; sudo)
-```
-
-If the build can't resolve hosts (common with Tailscale or other VPN DNS on
-the Mac), give the builder a public resolver and retry:
-`container builder delete; container builder start --dns 1.1.1.1`.
-This only affects the builder; sandboxes resolve through sandboxd.
+## Files
 
 `install.sh` puts `sandbox` and `sandboxd` in `~/.local/bin` and loads
-`~/Library/LaunchAgents/dev.squirrelsoft.sandboxd.plist`. Logs go to
-`~/Library/Logs/Sandboxd/sandboxd.log`.
-
-Files:
+`~/Library/LaunchAgents/dev.squirrelsoft.sandboxd.plist`.
 
 ```
 ~/Library/Application Support/Sandboxd/
     config.toml        image, cpus, memory, default_ttl, global allowlist, subnets, ports
     policies/*.toml    allowlist profiles (claude, codex, github, npm, pypi, crates)
+    agents/*.toml      agent presets (pi, claude, codex)
     state.db           sandboxes + lifecycle events
     sandboxd.sock      0600, owner-only; peer uid is checked too
     workspaces/        scratch workspaces

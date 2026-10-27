@@ -42,12 +42,45 @@ pub struct ContainerStatus {
     pub gateway: Option<IpAddr>,
 }
 
+// The JSON shapes below accept both container 0.x and 1.x output. 1.0
+// moved a container's state and network attachments under `status`, and a
+// network's `config` to `configuration`.
+
 #[derive(Deserialize)]
 struct InspectContainer {
-    status: String,
+    status: InspectContainerStatus,
+    /// 0.x: attachments at the top level.
     #[serde(default)]
     networks: Vec<InspectAttachment>,
     configuration: InspectConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InspectContainerStatus {
+    /// 0.x: `"status": "running"`.
+    State(String),
+    /// 1.x: `"status": {"state": "running", "networks": [...]}`.
+    Detailed {
+        state: String,
+        #[serde(default)]
+        networks: Vec<InspectAttachment>,
+    },
+}
+
+impl InspectContainer {
+    fn state(&self) -> &str {
+        match &self.status {
+            InspectContainerStatus::State(s) | InspectContainerStatus::Detailed { state: s, .. } => s,
+        }
+    }
+
+    fn attachment(&self) -> Option<&InspectAttachment> {
+        match &self.status {
+            InspectContainerStatus::Detailed { networks, .. } if !networks.is_empty() => networks.first(),
+            _ => self.networks.first(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -67,7 +100,7 @@ struct InspectConfig {
 #[derive(Deserialize)]
 struct InspectNetwork {
     id: String,
-    #[serde(default)]
+    #[serde(default, alias = "configuration")]
     config: InspectNetworkConfig,
     #[serde(default)]
     status: InspectNetworkStatus,
@@ -197,12 +230,12 @@ impl Runtime {
         };
         let mut list: Vec<InspectContainer> = serde_json::from_str(&out)?;
         let Some(c) = list.pop() else { return Ok(None) };
-        let net = c.networks.first();
+        let net = c.attachment();
         let parse = |s: Option<&String>| -> Option<IpAddr> {
             s.and_then(|s| s.split('/').next()).and_then(|s| s.parse().ok())
         };
         Ok(Some(ContainerStatus {
-            running: c.status == "running",
+            running: c.state() == "running",
             ip: parse(net.and_then(|n| n.ipv4_address.as_ref())),
             gateway: parse(net.and_then(|n| n.ipv4_gateway.as_ref())),
         }))
@@ -259,5 +292,37 @@ impl Runtime {
                 (n.id, id)
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_container_json_from_both_major_versions() {
+        let v0 = r#"[{"status":"running","networks":[{"ipv4Address":"10.213.1.2/24","ipv4Gateway":"10.213.1.1"}],
+            "configuration":{"id":"sbx-a","labels":{"dev.squirrelsoft.sandboxd":"1"}}}]"#;
+        let v1 = r#"[{"id":"sbx-a","status":{"state":"running","networks":[{"ipv4Address":"10.213.1.2/24",
+            "ipv4Gateway":"10.213.1.1","network":"sbx-a-net"}],"startedDate":"2026-10-27T17:02:45Z"},
+            "configuration":{"id":"sbx-a","labels":{"dev.squirrelsoft.sandboxd":"1"},"networks":[{"network":"sbx-a-net"}]}}]"#;
+        for json in [v0, v1] {
+            let c: Vec<InspectContainer> = serde_json::from_str(json).unwrap();
+            assert_eq!(c[0].state(), "running");
+            assert_eq!(c[0].attachment().unwrap().ipv4_gateway.as_deref(), Some("10.213.1.1"));
+            assert!(c[0].configuration.labels.contains_key(MANAGED_LABEL));
+        }
+    }
+
+    #[test]
+    fn parses_network_json_from_both_major_versions() {
+        let v0 = r#"[{"id":"n","config":{"labels":{"dev.squirrelsoft.sandboxd":"1"}},"status":{"ipv4Subnet":"10.213.1.0/24"}}]"#;
+        let v1 = r#"[{"id":"n","configuration":{"labels":{"dev.squirrelsoft.sandboxd":"1"},"mode":"hostOnly"},
+            "status":{"ipv4Gateway":"10.213.1.1","ipv4Subnet":"10.213.1.0/24"}}]"#;
+        for json in [v0, v1] {
+            let n: Vec<InspectNetwork> = serde_json::from_str(json).unwrap();
+            assert!(n[0].config.labels.contains_key(MANAGED_LABEL));
+            assert_eq!(n[0].status.ipv4_subnet.as_deref(), Some("10.213.1.0/24"));
+        }
     }
 }

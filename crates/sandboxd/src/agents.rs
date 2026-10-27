@@ -241,6 +241,13 @@ profiles = ["claude"]
 # Use an API key, or a long-lived token from `claude setup-token`.
 env = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
 
+# Skip the first-run prompts (theme, login method, folder trust). Nothing from
+# your ~/.claude.json is copied: it holds no credentials, just caches and
+# history for every project on your Mac.
+setup = [
+  """[ -e /root/.claude.json ] || echo '{"hasCompletedOnboarding":true,"theme":"dark","projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' > /root/.claude.json""",
+]
+
 [[config]]
 host = "~/.claude"
 container = "/root/.claude"

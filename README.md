@@ -124,8 +124,19 @@ forwards provider API keys. Add your own provider hosts to its `allow` list.
 To make pi the default, set `default_agents = ["pi"]` in `config.toml`
 (`--no-agent` opts out).
 
-Claude Code keeps its macOS login in the Keychain, so in a sandbox use
-`ANTHROPIC_API_KEY` or a `claude setup-token` token in `CLAUDE_CODE_OAUTH_TOKEN`.
+Claude Code keeps its macOS login in the Keychain (not `~/.claude.json`),
+so a sandbox needs its own credential:
+
+- **Subscription (Pro/Max):** run `claude setup-token` and export the result
+  as `CLAUDE_CODE_OAUTH_TOKEN`. It's a long-lived login token, not an API key:
+  usage counts against your plan, and it can be revoked without touching your
+  Mac's login.
+- **API billing:** export a Console key as `ANTHROPIC_API_KEY`.
+
+Copying the Keychain login in would break it:
+refresh tokens rotate, so whichever side refreshed first would log the other
+out. The claude preset writes a minimal `~/.claude.json` so first-run prompts
+are skipped.
 
 ### Lifecycle and recovery
 
